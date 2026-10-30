@@ -44,7 +44,7 @@ zulu	alpha1	bravo1	2.718281828	charlie1	\N	-1.7320508075	1000000	delta1	-1.61803
 2
 
 == SELECT * WITH CustomSchema more types than expected ==
-2
+same rows as with the inferred schema
 
 == SELECT * WITH CustomSchema less types than expected ==
 2

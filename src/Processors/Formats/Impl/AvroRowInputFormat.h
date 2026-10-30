@@ -224,6 +224,8 @@ public:
 
     NamesAndTypesList readSchema() override;
 
+    void transformTypesFromDifferentFilesIfNeeded(DataTypePtr & type, DataTypePtr & new_type) override;
+
     /// If `allow_nullable_tuple_type` is false, a union [null, record] is converted to a plain
     /// Tuple instead of Nullable(Tuple). Schema inference passes
     /// schema_inference_allow_nullable_tuple_type here, because otherwise it would return a type

@@ -26,10 +26,10 @@ $CLICKHOUSE_CLIENT -q "SELECT * FROM file('$file_name', 'Avro', '
 ') ORDER BY id"
 
 echo "== SELECT with more types than the union has =="
-$CLICKHOUSE_CLIENT -q "SELECT * FROM file('$file_name', 'Avro', '
+$CLICKHOUSE_CLIENT -q "SELECT id, payload, variantType(payload) FROM file('$file_name', 'Avro', '
   id Int32,
   payload Variant(Tuple(x Int32, s String), Tuple(y Float64), String),
   status Variant(Array(Int32), Enum8(\'a\' = 0, \'b\' = 1))
-')" 2>&1 | grep -m1 -c 'The number of distinct (non-null) union types in Avro record (2) does not match the number of types in destination Variant type (3)'
+') ORDER BY id"
 
 rm -f "$CLICKHOUSE_USER_FILES/$file_name"

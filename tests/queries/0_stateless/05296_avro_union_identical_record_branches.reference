@@ -13,4 +13,7 @@ status	Variant(Array(Int32), Enum8(\'a\' = 0, \'b\' = 1))
 3	(3.5)	[1,2,3]
 4	\N	a
 == SELECT with more types than the union has ==
-1
+1	(1,'accepted')	Tuple(x Int32, s String)
+2	(2,'rejected')	Tuple(x Int32, s String)
+3	(3.5)	Tuple(y Float64)
+4	\N	None

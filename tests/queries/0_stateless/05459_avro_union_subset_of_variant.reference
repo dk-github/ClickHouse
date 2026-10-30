@@ -1,0 +1,21 @@
+== old file, Variant with more types than the union ==
+1	(10)	Tuple(k Int64)
+2	('a')	Tuple(s String)
+== old and new files, explicit structure ==
+1	(10)	Tuple(k Int64)
+2	('a')	Tuple(s String)
+3	(2.5,7)	Tuple(n Float64, m Int64)
+4	(20)	Tuple(k Int64)
+== old and new files, schema_inference_mode = 'union' ==
+Variant(Tuple(\n    k Int64), Tuple(\n    n Float64,\n    m Int64), Tuple(\n    s String))
+1	(10)	Tuple(k Int64)
+2	('a')	Tuple(s String)
+3	(2.5,7)	Tuple(n Float64, m Int64)
+4	(20)	Tuple(k Int64)
+== old and evolved files, schema_inference_mode = 'union' ==
+Variant(Tuple(\n    k Int64), Tuple(\n    k Int64,\n    j String), Tuple(\n    s String))
+1	(10)	Tuple(k Int64)
+2	('a')	Tuple(s String)
+5	(30,'x')	Tuple(k Int64, j String)
+== new file, Variant without one of the union types ==
+1

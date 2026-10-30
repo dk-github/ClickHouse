@@ -86,7 +86,8 @@ $CH_CLIENT -q "select * from file('$file_name', 'Avro', '
 echo
 
 echo "== SELECT * WITH CustomSchema more types than expected =="
-$CH_CLIENT -q "select * from file('$file_name', 'Avro', '
+# Types missing from a union stay empty, so the rows are the same as with the inferred schema.
+diff <($CH_CLIENT -q "select * from file('$file_name')") <($CH_CLIENT -q "select * from file('$file_name', 'Avro', '
   string_only String,
   string_or_null Nullable(String),
   null_or_string Nullable(String),
@@ -99,7 +100,7 @@ $CH_CLIENT -q "select * from file('$file_name', 'Avro', '
   double_or_null_or_string_or_long Variant(Float64, String, Int64, Int64),
   double_or_long_or_string_in_array Array(Variant(Float64, String, Int64)),
   double_or_string_or_long_or_null_in_map Map(String, Variant(Float64, Int64, String))
-');" 2>&1 | grep -c 'DB::Exception: The number of distinct (non-null) union types in Avro record (2) does not match the number of types in destination Variant type (3).'
+');") && echo 'same rows as with the inferred schema'
 echo
 
 echo "== SELECT * WITH CustomSchema less types than expected =="
