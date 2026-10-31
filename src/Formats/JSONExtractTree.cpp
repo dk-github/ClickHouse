@@ -14,6 +14,7 @@
 #else
 #include <Common/JSONParsers/DummyJSONParser.h>
 #endif
+#include <Common/JSONParsers/JSONDocumentBuilder.h>
 
 #include <Columns/ColumnArray.h>
 #include <Columns/ColumnDynamic.h>
@@ -2994,5 +2995,7 @@ template bool tryGetNumericValueFromJSONElement<DummyJSONParser, Float64>(Float6
 template bool tryGetNumericValueFromJSONElement<DummyJSONParser, Int64>(Int64 & value, const DummyJSONParser::Element & element, bool convert_bool_to_number, bool allow_type_conversion, bool no_int_truncation_from_double, bool precise_float_parsing, String & error);
 template bool tryGetNumericValueFromJSONElement<DummyJSONParser, UInt64>(UInt64 & value, const DummyJSONParser::Element & element, bool convert_bool_to_number, bool allow_type_conversion, bool no_int_truncation_from_double, bool precise_float_parsing, String & error);
 #endif
+
+template std::unique_ptr<JSONExtractTreeNode<JSONDocumentBuilder>> buildJSONExtractTree<JSONDocumentBuilder>(const DataTypePtr & type, const char * source_for_exception_message);
 
 }

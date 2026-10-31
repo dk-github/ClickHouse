@@ -25,6 +25,7 @@ namespace ErrorCodes
 }
 
 class Block;
+class JSONDocumentBuilder;
 
 /// Maximum nesting depth for Avro schemas. Passed to the Avro library to
 /// prevent stack overflow on deeply nested schemas (e.g. crafted inputs with
@@ -69,7 +70,11 @@ public:
 
 private:
     using SkipFn = std::function<void(avro::Decoder & decoder)>;
+    /// Decodes an Avro value and adds it to a JSON document.
+    using BuildJSONFn = std::function<void(avro::Decoder & decoder, JSONDocumentBuilder & document)>;
     DeserializeFn createDeserializeFn(const avro::NodePtr & root_node, const DataTypePtr & target_type);
+    DeserializeFn createJSONDeserializeFn(const avro::NodePtr & root_node, const DataTypePtr & target_type);
+    BuildJSONFn createBuildJSONFn(const avro::NodePtr & root_node, bool null_as_empty_object);
     SkipFn createSkipFn(const avro::NodePtr & root_node);
 
     struct Action
@@ -228,9 +233,11 @@ public:
     /// Tuple instead of Nullable(Tuple). Schema inference passes
     /// schema_inference_allow_nullable_tuple_type here, because otherwise it would return a type
     /// that CREATE TABLE rejects.
-    static DataTypePtr avroNodeToDataType(avro::NodePtr node, bool allow_nullable_tuple_type = true);
+    /// If `union_as_json` is true, a union whose branches are all records or maps (or null) is converted to JSON.
+    static DataTypePtr avroNodeToDataType(avro::NodePtr node, bool allow_nullable_tuple_type = true, bool union_as_json = false);
 private:
-    static DataTypePtr avroNodeToDataTypeImpl(const avro::NodePtr & node, std::unordered_set<std::string> & seen_names, bool allow_nullable_tuple_type);
+    static DataTypePtr avroNodeToDataTypeImpl(
+        const avro::NodePtr & node, std::unordered_set<std::string> & seen_names, bool allow_nullable_tuple_type, bool union_as_json);
 
     bool confluent;
     const FormatSettings format_settings;

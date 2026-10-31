@@ -7,6 +7,8 @@
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnTuple.h>
 #include <Common/DateLUTImpl.h>
+#include <Common/FieldVisitorConvertToNumber.h>
+#include <Common/JSONParsers/JSONDocumentBuilder.h>
 #include <Common/checkStackSize.h>
 #include <Core/AccurateComparison.h>
 #include <Core/Field.h>
@@ -21,6 +23,7 @@
 #include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeNothing.h>
 #include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeObject.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/DataTypeUUID.h>
@@ -32,9 +35,13 @@
 #include <DataTypes/Serializations/SerializationMap.h>
 #include <DataTypes/Serializations/SerializationTuple.h>
 #include <Formats/FormatFactory.h>
+#include <Formats/JSONExtractTree.h>
 #include <Functions/DateTimeTransforms.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
+#include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
+#include <IO/readFloatText.h>
 #include <fmt/format.h>
 #include <Processors/Formats/Impl/AvroConfluentSchemaRegistry.h>
 #include <base/EnumReflection.h>
@@ -281,9 +288,35 @@ static bool canBeDeserializedFromFixed(const DataTypePtr & target_type, size_t f
     }
 }
 
+/// Whether every value of the node is a JSON object or null, so that it can be read into a JSON column.
+static bool isAvroObject(const avro::NodePtr & node)
+{
+    switch (node->type())
+    {
+        case avro::AVRO_RECORD: [[fallthrough]];
+        case avro::AVRO_MAP:
+            return true;
+        case avro::AVRO_SYMBOLIC:
+            return isAvroObject(avro::resolveSymbol(node));
+        case avro::AVRO_UNION:
+            for (size_t i = 0; i != node->leaves(); ++i)
+            {
+                const auto & branch = node->leafAt(static_cast<int>(i));
+                if (branch->type() != avro::AVRO_NULL && !isAvroObject(branch))
+                    return false;
+            }
+            return true;
+        default:
+            return false;
+    }
+}
+
 AvroDeserializer::DeserializeFn AvroDeserializer::createDeserializeFn(const avro::NodePtr & root_node, const DataTypePtr & target_type)
 {
     checkStackSize();
+
+    if (WhichDataType(target_type).isObject())
+        return createJSONDeserializeFn(root_node, target_type);
 
     if (target_type->lowCardinality())
     {
@@ -949,6 +982,223 @@ AvroDeserializer::DeserializeFn AvroDeserializer::createDeserializeFn(const avro
         target_type->getName(), avro::toString(root_node->type()), nodeToJSON(root_node));
 }
 
+/// Every Avro file carries the schema it was written with, so a value is decoded with that schema and needs no
+/// destination type: it is added to a JSON document, which is inserted by the same JSONExtractTree that inserts
+/// parsed JSON text. Files written with different versions of a schema (a new union branch, a new field, a new
+/// enum value) are all read into the same JSON column.
+AvroDeserializer::DeserializeFn AvroDeserializer::createJSONDeserializeFn(const avro::NodePtr & root_node, const DataTypePtr & target_type)
+{
+    if (!isAvroObject(root_node))
+        throw Exception(ErrorCodes::ILLEGAL_COLUMN,
+            "Cannot read Avro {} into {}: only records, maps and unions of them can be read into JSON:\n{}",
+            avro::toString(root_node->type()), target_type->getName(), nodeToJSON(root_node));
+
+    auto build_json = createBuildJSONFn(root_node, /* null_as_empty_object = */ true);
+    std::shared_ptr<const JSONExtractTreeNode<JSONDocumentBuilder>> json_extract_tree = buildJSONExtractTree<JSONDocumentBuilder>(target_type, "Avro");
+    JSONExtractInsertSettings insert_settings;
+    insert_settings.escape_dots_in_json_keys = settings.json.json_type_escape_dots_in_keys;
+    insert_settings.skip_invalid_typed_paths = settings.json.type_json_skip_invalid_typed_paths;
+    insert_settings.use_partial_match_to_skip_paths_by_regexp = settings.json.type_json_use_partial_match_to_skip_paths_by_regexp;
+    auto document = std::make_shared<JSONDocumentBuilder>();
+    return [build_json, json_extract_tree, insert_settings, document, &format_settings = settings](IColumn & column, avro::Decoder & decoder)
+    {
+        document->clear();
+        build_json(decoder, *document);
+
+        String error;
+        if (!json_extract_tree->insertResultToColumn(column, document->root(), insert_settings, format_settings, error))
+            throw Exception(ErrorCodes::INCORRECT_DATA, "Cannot insert data into JSON column: {}", error);
+        return true;
+    };
+}
+
+AvroDeserializer::BuildJSONFn AvroDeserializer::createBuildJSONFn(const avro::NodePtr & root_node, bool null_as_empty_object)
+{
+    checkStackSize();
+
+    if (root_node->logicalType().type() == avro::LogicalType::NONE)
+    {
+        switch (root_node->type())
+        {
+            case avro::AVRO_NULL:
+                /// A JSON column has no value for null, so the null branch of a top-level union is an empty object.
+                if (null_as_empty_object)
+                    return [](avro::Decoder & decoder, JSONDocumentBuilder & document)
+                    {
+                        decoder.decodeNull();
+                        document.finish(document.startObject());
+                    };
+                return [](avro::Decoder & decoder, JSONDocumentBuilder & document)
+                {
+                    decoder.decodeNull();
+                    document.addNull();
+                };
+            case avro::AVRO_BOOL:
+                return [](avro::Decoder & decoder, JSONDocumentBuilder & document) { document.addBool(decoder.decodeBool()); };
+            case avro::AVRO_INT:
+                return [](avro::Decoder & decoder, JSONDocumentBuilder & document) { document.addInt64(decoder.decodeInt()); };
+            case avro::AVRO_LONG:
+                return [](avro::Decoder & decoder, JSONDocumentBuilder & document) { document.addInt64(decoder.decodeLong()); };
+            case avro::AVRO_FLOAT:
+                /// Keep the shortest decimal representation of the float (0.1, not 0.10000000149011612), as when it is
+                /// written as text.
+                return [text = std::string()](avro::Decoder & decoder, JSONDocumentBuilder & document) mutable
+                {
+                    WriteBufferFromString out(text);
+                    writeFloatText(decoder.decodeFloat(), out);
+                    out.finalize();
+                    ReadBufferFromString in(text);
+                    double value = 0;
+                    if (!tryReadFloatTextPrecise(value, in))
+                        throw Exception(ErrorCodes::INCORRECT_DATA, "Cannot convert Avro float {} to double", text);
+                    document.addDouble(value);
+                };
+            case avro::AVRO_DOUBLE:
+                return [](avro::Decoder & decoder, JSONDocumentBuilder & document) { document.addDouble(decoder.decodeDouble()); };
+            case avro::AVRO_STRING:
+                return [value = std::string()](avro::Decoder & decoder, JSONDocumentBuilder & document) mutable
+                {
+                    decoder.decodeString(value);
+                    document.addString(value);
+                };
+            case avro::AVRO_BYTES:
+                return [value = std::vector<uint8_t>()](avro::Decoder & decoder, JSONDocumentBuilder & document) mutable
+                {
+                    decoder.decodeBytes(value);
+                    document.addString({reinterpret_cast<const char *>(value.data()), value.size()});
+                };
+            case avro::AVRO_FIXED:
+                return [size = root_node->fixedSize(), value = std::vector<uint8_t>()](avro::Decoder & decoder, JSONDocumentBuilder & document) mutable
+                {
+                    decoder.decodeFixed(size, value);
+                    document.addString({reinterpret_cast<const char *>(value.data()), value.size()});
+                };
+            case avro::AVRO_ENUM:
+            {
+                std::vector<std::string> symbols;
+                for (int i = 0; i != static_cast<int>(root_node->names()); ++i)
+                    symbols.push_back(root_node->nameAt(i));
+                return [symbols](avro::Decoder & decoder, JSONDocumentBuilder & document)
+                {
+                    size_t index = decoder.decodeEnum();
+                    if (index >= symbols.size())
+                        throw Exception(ErrorCodes::INCORRECT_DATA, "Enum index {} is out of range of {} symbols", index, symbols.size());
+                    document.addString(symbols[index]);
+                };
+            }
+            case avro::AVRO_RECORD:
+            {
+                std::vector<std::string> keys;
+                std::vector<BuildJSONFn> values;
+                for (int i = 0; i != static_cast<int>(root_node->leaves()); ++i)
+                {
+                    keys.push_back(root_node->nameAt(i));
+                    values.push_back(createBuildJSONFn(root_node->leafAt(i), false));
+                }
+                return [keys, values](avro::Decoder & decoder, JSONDocumentBuilder & document)
+                {
+                    auto object = document.startObject();
+                    for (size_t i = 0; i != keys.size(); ++i)
+                    {
+                        document.addKey(keys[i]);
+                        values[i](decoder, document);
+                    }
+                    document.finish(object);
+                };
+            }
+            case avro::AVRO_ARRAY:
+            {
+                auto element = createBuildJSONFn(root_node->leafAt(0), false);
+                return [element](avro::Decoder & decoder, JSONDocumentBuilder & document)
+                {
+                    auto array = document.startArray();
+                    for (size_t n = decoder.arrayStart(); n != 0; n = decoder.arrayNext())
+                        for (size_t i = 0; i != n; ++i)
+                            element(decoder, document);
+                    document.finish(array);
+                };
+            }
+            case avro::AVRO_MAP:
+            {
+                auto value = createBuildJSONFn(root_node->leafAt(1), false);
+                return [value, key = std::string()](avro::Decoder & decoder, JSONDocumentBuilder & document) mutable
+                {
+                    auto object = document.startObject();
+                    for (size_t n = decoder.mapStart(); n != 0; n = decoder.mapNext())
+                    {
+                        for (size_t i = 0; i != n; ++i)
+                        {
+                            decoder.decodeString(key);
+                            document.addKey(key);
+                            value(decoder, document);
+                        }
+                    }
+                    document.finish(object);
+                };
+            }
+            case avro::AVRO_UNION:
+            {
+                std::vector<BuildJSONFn> branches;
+                for (int i = 0; i != static_cast<int>(root_node->leaves()); ++i)
+                    branches.push_back(createBuildJSONFn(root_node->leafAt(i), null_as_empty_object));
+                return [branches](avro::Decoder & decoder, JSONDocumentBuilder & document)
+                {
+                    size_t index = decoder.decodeUnionIndex();
+                    if (index >= branches.size())
+                        throw Exception(ErrorCodes::INCORRECT_DATA, "Union index out of boundary");
+                    branches[index](decoder, document);
+                };
+            }
+            case avro::AVRO_SYMBOLIC:
+            {
+                const auto & sym_name = root_node->name().fullname();
+                if (!symbolic_deserialize_guard.insert(sym_name).second)
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "Recursive Avro schema is not supported: type '{}' references itself", sym_name);
+                auto result = createBuildJSONFn(avro::resolveSymbol(root_node), null_as_empty_object);
+                symbolic_deserialize_guard.erase(sym_name);
+                return result;
+            }
+            default:
+                break;
+        }
+    }
+
+    /// Logical types (date, timestamp, decimal, uuid) are read as the type schema inference gives them. Numbers are
+    /// added as numbers, other values as their text, from which the JSON column infers e.g. Date or DateTime64.
+    auto type = AvroSchemaReader::avroNodeToDataType(root_node);
+    auto deserialize = createDeserializeFn(root_node, type);
+    auto serialization = type->getDefaultSerialization();
+    auto column = std::make_shared<MutableColumnPtr>(type->createColumn());
+    const WhichDataType which(type);
+    return [deserialize, serialization, column, which, &format_settings = settings, text = std::string()](
+               avro::Decoder & decoder, JSONDocumentBuilder & document) mutable
+    {
+        IColumn & value = **column;
+        deserialize(value, decoder);
+        if (which.isNativeInt())
+        {
+            document.addInt64(value.getInt(0));
+        }
+        else if (which.isNativeUInt())
+        {
+            document.addUInt64(value.getUInt(0));
+        }
+        else if (which.isFloat() || which.isDecimal())
+        {
+            document.addDouble(applyVisitor(FieldVisitorConvertToNumber<Float64>(), value[0]));
+        }
+        else
+        {
+            WriteBufferFromString out(text);
+            serialization->serializeText(value, 0, out, format_settings);
+            out.finalize();
+            document.addString(text);
+        }
+        value.popBack(1);
+    };
+}
+
 AvroDeserializer::SkipFn AvroDeserializer::createSkipFn(const avro::NodePtr & root_node)
 {
     checkStackSize();
@@ -1425,18 +1675,20 @@ NamesAndTypesList AvroSchemaReader::readSchema()
 
     NamesAndTypesList names_and_types;
     for (int i = 0; i != static_cast<int>(root_node->leaves()); ++i)
-        names_and_types.emplace_back(root_node->nameAt(i), avroNodeToDataType(root_node->leafAt(i), format_settings.schema_inference_allow_nullable_tuple_type));
+        names_and_types.emplace_back(
+            root_node->nameAt(i),
+            avroNodeToDataType(root_node->leafAt(i), format_settings.schema_inference_allow_nullable_tuple_type, format_settings.avro.union_as_json));
 
     return names_and_types;
 }
 
-DataTypePtr AvroSchemaReader::avroNodeToDataType(avro::NodePtr node, bool allow_nullable_tuple_type)
+DataTypePtr AvroSchemaReader::avroNodeToDataType(avro::NodePtr node, bool allow_nullable_tuple_type, bool union_as_json)
 {
     std::unordered_set<std::string> seen_names;
-    return avroNodeToDataTypeImpl(node, seen_names, allow_nullable_tuple_type);
+    return avroNodeToDataTypeImpl(node, seen_names, allow_nullable_tuple_type, union_as_json);
 }
 
-DataTypePtr AvroSchemaReader::avroNodeToDataTypeImpl(const avro::NodePtr & node, std::unordered_set<std::string> & seen_names, bool allow_nullable_tuple_type)
+DataTypePtr AvroSchemaReader::avroNodeToDataTypeImpl(const avro::NodePtr & node, std::unordered_set<std::string> & seen_names, bool allow_nullable_tuple_type, bool union_as_json)
 {
     checkStackSize();
 
@@ -1508,15 +1760,20 @@ DataTypePtr AvroSchemaReader::avroNodeToDataTypeImpl(const avro::NodePtr & node,
             return std::make_shared<DataTypeFixedString>(node->fixedSize());
         }
         case avro::Type::AVRO_ARRAY:
-            return std::make_shared<DataTypeArray>(avroNodeToDataTypeImpl(node->leafAt(0), seen_names, allow_nullable_tuple_type));
+            return std::make_shared<DataTypeArray>(avroNodeToDataTypeImpl(node->leafAt(0), seen_names, allow_nullable_tuple_type, union_as_json));
         case avro::Type::AVRO_NULL:
             return std::make_shared<DataTypeNothing>();
         case avro::Type::AVRO_UNION:
         {
+            /// A union of records (e.g. messages of a stream) changes with every new message type or field,
+            /// while JSON reads files written with any version of it.
+            if (union_as_json && isAvroObject(node))
+                return std::make_shared<DataTypeObject>(DataTypeObject::SchemaFormat::JSON);
+
             // Treat union[T] as just T
             if (node->leaves() == 1)
             {
-                return avroNodeToDataTypeImpl(node->leafAt(0), seen_names, allow_nullable_tuple_type);
+                return avroNodeToDataTypeImpl(node->leafAt(0), seen_names, allow_nullable_tuple_type, union_as_json);
             }
 
             // Treat union[T, NULL] and union[NULL, T] as Nullable(T)
@@ -1525,7 +1782,7 @@ DataTypePtr AvroSchemaReader::avroNodeToDataTypeImpl(const avro::NodePtr & node,
                 && (node->leafAt(0)->type() == avro::Type::AVRO_NULL || node->leafAt(1)->type() == avro::Type::AVRO_NULL))
             {
                 int nested_leaf_index = node->leafAt(0)->type() == avro::Type::AVRO_NULL ? 1 : 0;
-                auto nested_type = avroNodeToDataTypeImpl(node->leafAt(nested_leaf_index), seen_names, allow_nullable_tuple_type);
+                auto nested_type = avroNodeToDataTypeImpl(node->leafAt(nested_leaf_index), seen_names, allow_nullable_tuple_type, union_as_json);
                 if (isTuple(nested_type) && !allow_nullable_tuple_type)
                     return nested_type;
                 return nested_type->canBeInsideNullable() ? makeNullable(nested_type) : nested_type;
@@ -1543,14 +1800,14 @@ DataTypePtr AvroSchemaReader::avroNodeToDataTypeImpl(const avro::NodePtr & node,
                 if (node->leafAt(i)->type() == avro::Type::AVRO_NULL) continue;
 
                 const auto & avro_node = node->leafAt(i);
-                nested_types.push_back(avroNodeToDataTypeImpl(avro_node, seen_names, allow_nullable_tuple_type));
+                nested_types.push_back(avroNodeToDataTypeImpl(avro_node, seen_names, allow_nullable_tuple_type, union_as_json));
             }
             return std::make_shared<DataTypeVariant>(nested_types);
         }
         case avro::Type::AVRO_SYMBOLIC:
         {
             auto resolved = avro::resolveSymbol(node);
-            return avroNodeToDataTypeImpl(resolved, seen_names, allow_nullable_tuple_type);
+            return avroNodeToDataTypeImpl(resolved, seen_names, allow_nullable_tuple_type, union_as_json);
         }
         case avro::Type::AVRO_RECORD:
         {
@@ -1565,7 +1822,7 @@ DataTypePtr AvroSchemaReader::avroNodeToDataTypeImpl(const avro::NodePtr & node,
             nested_names.reserve(node->leaves());
             for (int i = 0; i != static_cast<int>(node->leaves()); ++i)
             {
-                nested_types.push_back(avroNodeToDataTypeImpl(node->leafAt(i), seen_names, allow_nullable_tuple_type));
+                nested_types.push_back(avroNodeToDataTypeImpl(node->leafAt(i), seen_names, allow_nullable_tuple_type, union_as_json));
                 nested_names.push_back(node->nameAt(i));
             }
 
@@ -1573,7 +1830,7 @@ DataTypePtr AvroSchemaReader::avroNodeToDataTypeImpl(const avro::NodePtr & node,
             return std::make_shared<DataTypeTuple>(nested_types, nested_names);
         }
         case avro::Type::AVRO_MAP:
-            return std::make_shared<DataTypeMap>(avroNodeToDataTypeImpl(node->leafAt(0), seen_names, allow_nullable_tuple_type), avroNodeToDataTypeImpl(node->leafAt(1), seen_names, allow_nullable_tuple_type));
+            return std::make_shared<DataTypeMap>(avroNodeToDataTypeImpl(node->leafAt(0), seen_names, allow_nullable_tuple_type, union_as_json), avroNodeToDataTypeImpl(node->leafAt(1), seen_names, allow_nullable_tuple_type, union_as_json));
         default:
             throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Avro column {} is not supported for inserting.", nodeName(node));
     }
@@ -1626,6 +1883,7 @@ import DataTypeMapping from '/snippets/data-types-matching.mdx';
 |---------------------------------------------|-----------------------------------------------------------------------------------------------------|---------|
 | `input_format_avro_allow_missing_fields`    | Whether to use a default value instead of throwing an error when a field is not found in the schema. | `0`     |
 | `input_format_avro_null_as_default`         | Whether to use a default value instead of throwing an error when inserting a `null` value into a non-nullable column. |   `0`   |
+| `input_format_avro_union_as_json`           | Whether to infer a union of records as `JSON` instead of `Variant`, so that files written with different versions of the schema can be read together. | `0`     |
 | `output_format_avro_codec`                  | Compression algorithm for Avro output files. Possible values: `null`, `deflate`, `snappy`, `zstd`.            |         |
 | `output_format_avro_sync_interval`          | Sync marker frequency in Avro files (in bytes). | `16384` |
 | `output_format_avro_string_column_pattern`  | Regular expression to identify `String` columns for Avro string type mapping. By default, ClickHouse `String` columns are written as Avro `bytes` type.                                 |         |
@@ -1690,6 +1948,19 @@ DESCRIBE url('https://clickhouse-public-datasets.s3.eu-central-1.amazonaws.com/h
 │ RequestTry                 │ Int32           │              │                    │         │                  │                │
 └────────────────────────────┴─────────────────┴──────────────┴────────────────────┴─────────┴──────────────────┴────────────────┘
 ```
+
+### Reading files written with different schemas {#reading-files-written-with-different-schemas}
+
+A union is inferred as a `Variant` with one type per branch, and a record as a `Tuple`. When a stream's schema changes (a new record in a union, a new field or enum value in a record), files written before and after the change have different types and cannot be read in one query.
+
+A record, a map, or a union of them can be read into a [`JSON`](/reference/data-types/newjson) column instead. Every Avro file is decoded with the schema it was written with, so files written with any version of the schema are read into the same column:
+
+```sql
+SELECT payload.order_id, payload.side
+FROM s3('https://bucket.s3.amazonaws.com/stream/**.avro', 'Avro', 'seq Int64, payload JSON');
+```
+
+With [`input_format_avro_union_as_json`](/reference/settings/formats/input-format#input_format_avro_union_as_json) enabled, schema inference gives such unions the `JSON` type, and no structure is needed.
 )DOCS_MD"});
 
     factory.setDocumentation("AvroConfluent", Documentation{
@@ -1827,7 +2098,9 @@ void registerAvroSchemaReader(FormatFactory & factory)
         factory.registerAdditionalInfoForSchemaCacheGetter(format_name, [](const FormatSettings & settings)
         {
             return fmt::format(
-                "schema_inference_allow_nullable_tuple_type={}", settings.schema_inference_allow_nullable_tuple_type);
+                "schema_inference_allow_nullable_tuple_type={}, union_as_json={}",
+                settings.schema_inference_allow_nullable_tuple_type,
+                settings.avro.union_as_json);
         });
     }
 }

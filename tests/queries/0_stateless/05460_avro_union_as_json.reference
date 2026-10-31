@@ -1,0 +1,45 @@
+== Inferred as Variant: a query over all releases fails ==
+1
+== Read into JSON: one query over all releases ==
+1	{"order_id":101,"side":"Buy"}
+2	{"price":9.5,"trade_id":201}
+3	{"order_id":101,"reason":"user"}
+4	{"order_id":102,"side":"Sell"}
+5	{"order_id":103,"side":"Short","tags":{"desk":"fx"}}
+6	{"day":"2026-10-28","fills":[{"qty":5,"venue":"XETR"},{"qty":3,"venue":"LSE"}],"price":10.25,"trade_id":202}
+7	{}
+== Plain SQL over all releases: the new enum value is just another string ==
+1	101	Buy	\N
+3	101	\N	user
+4	102	Sell	\N
+5	103	Short	\N
+2	9.5	\N	[]	0
+6	10.25	2026-10-28	['XETR','LSE']	8
+== Paths and types over all releases ==
+('day',['Date'])
+('fills',['Array(JSON(max_dynamic_types=16, max_dynamic_paths=256))'])
+('order_id',['Int64'])
+('price',['Float64'])
+('reason',['String'])
+('side',['String'])
+('tags.desk',['String'])
+('trade_id',['Int64'])
+== input_format_avro_union_as_json = 1: no structure needed ==
+seq	Int64					
+payload	JSON					
+1	101	\N
+2	\N	201
+3	101	\N
+4	102	\N
+5	103	\N
+6	\N	202
+7	\N	\N
+== Records and maps can be read into JSON too ==
+{"ratio":0.1,"source":"offload","version":14}	{"orders":3,"trades":2}
+== Binary bytes are kept as they are ==
+C328FF00
+== Scalars and unions of scalars cannot be read into JSON ==
+1
+1
+n	Int64					
+v	Variant(Int64, String)					

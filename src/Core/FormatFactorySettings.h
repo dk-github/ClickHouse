@@ -946,6 +946,12 @@ For Values format: when parsing and interpreting expressions using template, che
     DECLARE(Bool, input_format_avro_allow_missing_fields, false, R"(
 For Avro/AvroConfluent format: when field is not found in schema use default value instead of error
 )", 0) \
+    DECLARE(Bool, input_format_avro_union_as_json, false, R"(
+For Avro/AvroConfluent format: infer a union whose branches are all records or maps (or null) as `JSON` instead of `Variant`.
+
+A `Variant` has one type per record, so files written with different versions of the schema (a new record in the union, a new field or enum value in a record) infer different types and cannot be read in one query. Every Avro file is decoded with its own schema, so all of them can be read into the same `JSON` column. A column can also be given the `JSON` type explicitly, without this setting.
+)", 0, \
+        {"26.11", false, false, "New setting."}) \
     /** This setting is obsolete and do nothing, left for compatibility reasons. */ \
     DECLARE(Bool, input_format_avro_null_as_default, false, R"(
 For Avro/AvroConfluent format: insert default in case of null and non Nullable column
